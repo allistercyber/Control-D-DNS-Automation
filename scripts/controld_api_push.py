@@ -10,7 +10,10 @@ folder against the desired state (file on disk) by:
 Reconciliation is based on the LIVE API state, not git history, so the
 script is idempotent and self-healing across retried/partial runs.
 
-Exits 0 on full success, 1 if any operation failed (non-fatal to workflow).
+Which files map to which profiles/folders is defined in config.toml (see
+config.example.toml and CONFIGURATION.md).
+
+Exits 0 on full success, 1 if any operation failed (the workflow step fails).
 """
 
 import os
@@ -28,6 +31,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import requests
 from urllib.parse import quote
 
+from controld_config import Config, ConfigError, load_config
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -40,59 +45,19 @@ log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USER CONFIGURATION
-# Edit the section below to match your Control D account.
+# CONSTANTS
+# Which files go to which profiles/folders (and the delete-safety threshold) is
+# configured in config.toml, not here.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Directory (relative to repo root) where the synced JSON files are stored.
-# Should match TARGET_DIR in controld_sync.py — no trailing slash.
+# Directory (relative to repo root) where Stage 1 stores the synced JSON files.
+# Must match TARGET_DIR in controld_sync.py — no trailing slash.
 CONTROLD_DIR = "controld"
-
-# FILE_MAPPINGS tells the script which upstream JSON file maps to which
-# Control D profile and folder.
-#
-# Format:
-#   "upstream-filename.json": [
-#       ("Your Profile Name", "Your Folder Name"),
-#       # Add more (profile, folder) pairs if you want the same file to sync
-#       # to multiple profiles simultaneously.
-#   ],
-#
-# How to find your profile and folder names:
-#   Control D dashboard → Profiles → click a profile → note the profile name
-#   at the top, then expand the folder list on the left to find folder names.
-#   Names are case-sensitive and must match exactly.
-#
-# Remove any entry you don't want to push; add entries for new files as needed.
-# Processing order matters: within a single profile, domains claimed by an
-# earlier entry are excluded from later entries (cross-folder deduplication).
-# Put allow-folders before block-folders to ensure allow takes priority.
-
-FILE_MAPPINGS: Dict[str, List[Tuple[str, str]]] = {
-    # Example only — replace profile and folder names with yours.
-    # Names are case-sensitive and must match the Control D dashboard exactly.
-
-    # Sync one upstream file to a single profile/folder:
-    "apple-private-relay-allow-folder.json": [
-        ("Home", "Apple Private Relay Block"),
-    ],
-
-    # Sync the same file to two profiles at once:
-    "spam-tlds-folder.json": [
-        ("Home",   "Blocked TLDs"),
-        ("Travel", "Blocked TLDs"),
-    ],
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# INTERNAL CONSTANTS — no need to change these
-# ══════════════════════════════════════════════════════════════════════════════
 
 BASE_URL           = "https://api.controld.com"
 PAGE_SIZE          = 500    # max hostnames per POST /rules batch request
 REQUEST_DELAY      = 0.5    # seconds between API calls (rate-limit headroom)
 DELETE_DELAY       = 0.25   # seconds between individual DELETE calls
-MAX_DELETE_PERCENT = 50     # abort if removals exceed this % of the live folder size
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
@@ -139,7 +104,9 @@ def fetch_profiles(api_token: str) -> Dict[str, str]:
         pk   = p.get("PK", "")
         if name and pk:
             result[name] = pk
-    log.info(f"Discovered profiles: {list(result.keys())}")
+    # Count only: Actions logs are public on public repositories, so the names
+    # of every profile in the account are not written to them.
+    log.info(f"Discovered {len(result)} profile(s) in the account")
     return result
 
 
@@ -152,7 +119,7 @@ def fetch_folders(profile_pk: str, api_token: str) -> Dict[str, str]:
         pk   = g.get("PK", "")
         if name and pk:
             result[name] = pk
-    log.info(f"  Folders in profile {profile_pk}: {list(result.keys())}")
+    log.info(f"  Discovered {len(result)} folder(s) in the profile")
     return result
 
 
@@ -297,6 +264,7 @@ def sync_folder(
     folder_name: str,
     desired: Set[str],
     api_token: str,
+    max_delete_percent: int,
 ) -> Tuple[bool, List[str], List[str]]:
     """
     Reconciles a single Control D folder to match `desired`.
@@ -307,7 +275,9 @@ def sync_folder(
     try:
         time.sleep(REQUEST_DELAY)
         live = fetch_live_hostnames(profile_pk, folder_pk, api_token)
-    except requests.HTTPError as exc:
+    except requests.RequestException as exc:
+        # RequestException (not just HTTPError) so timeouts/connection errors
+        # that survive the retries fail this folder instead of crashing the run.
         log.error(f"  Failed to fetch live rules for '{folder_name}': {exc}")
         return False, [], []
 
@@ -322,12 +292,12 @@ def sync_folder(
     # to 10 entries would still reach here).
     if live and to_remove:
         remove_pct = len(to_remove) * 100 // len(live)
-        if remove_pct > MAX_DELETE_PERCENT:
+        if remove_pct > max_delete_percent:
             log.error(
                 f"  Aborting sync for '{folder_name}': {len(to_remove)} removals "
                 f"({remove_pct}% of {len(live)} live entries) exceeds the "
-                f"{MAX_DELETE_PERCENT}% safety threshold. "
-                f"Set MAX_DELETE_PERCENT higher if this is intentional."
+                f"{max_delete_percent}% safety threshold. "
+                f"Raise max_delete_percent in config.toml if this is intentional."
             )
             return False, [], []
 
@@ -379,17 +349,15 @@ def sync_folder(
 
 # ── Main run ──────────────────────────────────────────────────────────────────
 
-def run(api_token: str) -> Tuple[bool, str]:
+def run(api_token: str, config: Config) -> Tuple[bool, str]:
     """
-    Processes all FILE_MAPPINGS entries.
+    Processes every [[lists]] entry in config.toml, in order.
 
     Cross-folder deduplication: within each profile, domains claimed by an
     earlier-processed folder are excluded from later folders. This prevents
     the same domain appearing in both an allow and a block folder.
-    Processing order follows FILE_MAPPINGS declaration order.
+    Processing order follows the order of the [[lists]] entries.
 
-    Also writes the email body to GITHUB_OUTPUT (for any downstream workflow
-    steps that may need it).
     Returns (success, email_body): True only if every operation succeeded.
     """
     overall_success = True
@@ -422,7 +390,8 @@ def run(api_token: str) -> Tuple[bool, str]:
         return folder_cache[profile_pk]
 
     # Process each file → profile/folder mapping
-    for filename, mappings in FILE_MAPPINGS.items():
+    for entry in config.lists:
+        filename, mappings = entry.file, entry.targets
         file_path = f"{CONTROLD_DIR}/{filename}"
         log.info(f"\n📄 File: {filename}")
 
@@ -440,7 +409,10 @@ def run(api_token: str) -> Tuple[bool, str]:
 
             profile_pk = profile_map.get(profile_name)
             if not profile_pk:
-                log.error(f"    Profile '{profile_name}' not found — skipping")
+                log.error(
+                    f"    Profile '{profile_name}' not found among the account's "
+                    f"{len(profile_map)} profile(s) — skipping (names are case-sensitive)"
+                )
                 overall_success = False
                 report[profile_name].append((folder_name, [], [], 0, "profile not found"))
                 continue
@@ -468,13 +440,14 @@ def run(api_token: str) -> Tuple[bool, str]:
                 log.info(f"    Deduplication: {n_skipped} domain(s) skipped (already in another folder in this profile)")
 
             ok, added, removed = sync_folder(
-                profile_pk, folder_pk, folder_name, effective_desired, api_token
+                profile_pk, folder_pk, folder_name, effective_desired, api_token,
+                config.max_delete_percent,
             )
 
             # Only claim these domains once the folder actually reconciled.
             # Claiming up-front would exclude them from every later folder in
             # this profile even when this folder failed or was aborted by the
-            # MAX_DELETE_PERCENT guardrail — the later folder would then treat
+            # max_delete_percent guardrail — the later folder would then treat
             # them as unwanted and delete them, leaving them in no folder at all.
             if ok:
                 claimed_per_profile.setdefault(profile_name, set()).update(effective_desired)
@@ -514,27 +487,28 @@ def run(api_token: str) -> Tuple[bool, str]:
 
     email_body = "\n".join(body_parts)
 
-    # Write email body to GITHUB_OUTPUT for any downstream workflow steps.
-    github_output = os.environ.get("GITHUB_OUTPUT", "")
-    if github_output:
-        with open(github_output, "a", encoding="utf-8") as fh:
-            fh.write("email_body<<CTRLD_EOF\n")
-            fh.write(email_body)
-            fh.write("\nCTRLD_EOF\n")
-        log.info("Email body written to GITHUB_OUTPUT")
-
     return overall_success, email_body
 
 
 # ── Email send ────────────────────────────────────────────────────────────────
 
-GMAIL_SMTP_SERVER = "smtp.gmail.com"
+DEFAULT_SMTP_HOST = "smtp.gmail.com"
+DEFAULT_SMTP_PORT = 465
 
 
 def send_email(email_body: str) -> None:
     """
-    Sends the sync report email via Gmail (smtp.gmail.com, port 465, implicit TLS).
-    Reads credentials from environment variables (set as GitHub secrets).
+    Sends the sync report by email.  Entirely optional: skipped unless both
+    EMAIL_USERNAME and EMAIL_PASSWORD are set.
+
+    Environment variables (see CONFIGURATION.md):
+      EMAIL_USERNAME   SMTP login; also the sender, and the recipient unless
+                       EMAIL_TO is set.
+      EMAIL_PASSWORD   SMTP password / app password.
+      EMAIL_TO         Recipient address (default: EMAIL_USERNAME).
+      EMAIL_SMTP_HOST  SMTP server (default: smtp.gmail.com).
+      EMAIL_SMTP_PORT  465 = implicit TLS (default); any other port uses
+                       STARTTLS.
     """
     username  = os.environ.get("EMAIL_USERNAME", "").strip()
     password  = os.environ.get("EMAIL_PASSWORD", "").strip()
@@ -546,15 +520,30 @@ def send_email(email_body: str) -> None:
         log.warning("EMAIL_PASSWORD missing — skipping email send")
         return
 
+    recipient = os.environ.get("EMAIL_TO", "").strip() or username
+    host      = os.environ.get("EMAIL_SMTP_HOST", "").strip() or DEFAULT_SMTP_HOST
+    port_text = os.environ.get("EMAIL_SMTP_PORT", "").strip() or str(DEFAULT_SMTP_PORT)
+    try:
+        port = int(port_text)
+    except ValueError:
+        log.error(f"EMAIL_SMTP_PORT must be a number (got {port_text!r}) — skipping email send")
+        return
+
     msg = MIMEMultipart()
     msg["From"]    = username
-    msg["To"]      = username
+    msg["To"]      = recipient
     msg["Subject"] = "Control D sync report"
     msg.attach(MIMEText(email_body, "plain"))
 
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(GMAIL_SMTP_SERVER, 465, context=context, timeout=30) as smtp:
+        if port == 465:
+            smtp_cm = smtplib.SMTP_SSL(host, port, context=context, timeout=30)
+        else:
+            smtp_cm = smtplib.SMTP(host, port, timeout=30)
+        with smtp_cm as smtp:
+            if port != 465:
+                smtp.starttls(context=context)
             smtp.login(username, password)
             smtp.send_message(msg)
         log.info("Email sent successfully")
@@ -570,8 +559,14 @@ def main() -> None:
         log.error("CTRLD_API_TOKEN environment variable is not set or empty")
         sys.exit(1)
 
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        log.error(str(exc))
+        sys.exit(1)
+
     log.info("=== Control D API push: start ===")
-    success, email_body = run(api_token)
+    success, email_body = run(api_token, config)
 
     if email_body:
         send_email(email_body)

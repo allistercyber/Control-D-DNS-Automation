@@ -1,230 +1,184 @@
-# Configuration Guide
+# Configuration reference
 
->  💡 **Privacy & security note:** This repo runs entirely within your own GitHub Actions environment. Your API token is used only for outbound requests to the Control D API, and email credentials only for outbound SMTP — neither is logged or persisted beyond the runner. For maximum privacy and security it is recommended to keep your fork **private** — this prevents your profile names, folder names, and workflow configuration from being publicly visible.
+Everything you can configure, with defaults. For an overview and setup steps see [README.md](README.md).
 
-This document covers every value you need to change to make this workflow work for your own Control D account.
+| What | Where |
+|---|---|
+| Lists to sync, profile/folder targets, safety settings | `config.toml` (you create it from `config.example.toml`) |
+| Credentials | GitHub Actions **secrets** |
+| Optional email server | GitHub Actions **variables** |
+| When the workflow runs | `on:` block of `.github/workflows/sync-controld.yml` |
 
----
-
-## Files to edit
-
-| File | What to change |
-|------|----------------|
-| `scripts/controld_api_push.py` | `FILE_MAPPINGS` — which upstream files map to which of your profiles/folders |
-| `scripts/controld_sync.py` | `TARGET_FILES` — which upstream files to download (should match `FILE_MAPPINGS` keys) |
+There is nothing to edit in the Python scripts.
 
 ---
 
-## `FILE_MAPPINGS` in `controld_api_push.py`
+## `config.toml`
 
-This is the primary configuration. It tells Stage 2 which Control D folder to push each JSON file's domains into.
+Read by both stages. Location: `config.toml` in the repository root, or the path in the `CONTROLD_SYNC_CONFIG` environment variable. If the file is missing or invalid, the workflow fails in its *Validate configuration* step before any network call. Unknown keys are rejected, so typos are caught.
 
-### Format
+Validate locally (Python 3.11+, no network): `python scripts/controld_config.py [path]`.
 
-```python
-FILE_MAPPINGS: Dict[str, List[Tuple[str, str]]] = {
-    "upstream-filename.json": [
-        ("Your Profile Name", "Your Folder Name"),
-    ],
-}
-```
+### `[settings]` (optional table)
 
-Each entry maps one upstream filename to a list of `(profile_name, folder_name)` pairs. One file can sync to multiple profiles simultaneously — just add more pairs to the list.
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `max_delete_percent` | integer 1–100 | `50` | Abort the sync of a folder if it would remove more than this percentage of the folder's current rules. Protects against a truncated upstream file. Only applies when the folder already has rules. |
+| `mirror_fallback` | boolean | `true` | If GitHub is unreachable after 5 attempts (60 s apart), download from the official Hagezi build mirror `hagezi-mirror.dnsbunker.org` instead. `false` = GitHub only. |
 
-### How to find your profile and folder names
+### `[[lists]]` (required, at least one)
 
-1. Log into the [Control D dashboard](https://controld.com/dashboard)
-2. Go to **Profiles** in the left sidebar
-3. The profile name is shown at the top of each profile — **copy it exactly, it is case-sensitive**
-4. Inside a profile, open the folder list on the left — **copy the folder name exactly**
+One block per upstream file. Blocks are processed in file order.
 
-### Example
+| Key | Type | Meaning |
+|---|---|---|
+| `file` | string | Filename in [hagezi/dns-blocklists → `controld/`](https://github.com/hagezi/dns-blocklists/tree/main/controld), e.g. `spam-tlds-folder.json`. Must be a plain name ending in `.json` (no `/`, no leading `.`). |
+| `targets` | array of `{ profile, folder }` | One or more Control D profile/folder pairs that mirror this file. |
 
-```python
-FILE_MAPPINGS: Dict[str, List[Tuple[str, str]]] = {
-    # Sync Apple Private Relay list to one profile
-    "apple-private-relay-allow-folder.json": [
-        ("Home", "Apple Private Relay Block"),
-    ],
+Rules enforced at load time:
 
-    # Sync spam TLDs to two profiles at once
-    "spam-tlds-folder.json": [
-        ("Home",   "Blocked TLDs"),
-        ("Travel", "Blocked TLDs"),
-    ],
-}
-```
+- each `file` appears once;
+- each `profile`/`folder` pair appears in only one `[[lists]]` block (a folder reconciles to exactly one file; two files would keep deleting each other's domains);
+- `profile` and `folder` are non-empty strings.
 
-### Available upstream files
+```toml
+[settings]
+max_delete_percent = 50
+mirror_fallback = true
 
-The hagezi repo publishes a large number of Control D-compatible JSON files covering everything from tracker allow-lists to spam TLDs. Browse the full list here:
+[[lists]]
+file = "apple-private-relay-allow-folder.json"
+targets = [{ profile = "Home", folder = "Apple Private Relay Allow" }]
 
-**[hagezi/dns-blocklists — controld/](https://github.com/hagezi/dns-blocklists/tree/main/controld)**
-
-Add any filename from that directory to `TARGET_FILES` and `FILE_MAPPINGS` to start syncing it. This workflow is not limited to any particular subset — use whatever files suit your setup.
-
-### Processing order and cross-folder deduplication
-
-Within a single profile, domains claimed by an **earlier** entry in `FILE_MAPPINGS` are excluded from **later** entries. This prevents the same domain appearing in both an allow folder and a block folder at the same time.
-
-**Practical rule:** put allow-folders before block-folders in `FILE_MAPPINGS`.
-
----
-
-## `TARGET_FILES` in `controld_sync.py`
-
-This controls which files Stage 1 downloads from the upstream repo. It should match the keys you have in `FILE_MAPPINGS` — no more, no less.
-
-```python
-TARGET_FILES: List[str] = [
-    "apple-private-relay-allow-folder.json",
-    "spam-tlds-folder.json",
-    # add or remove filenames here
+[[lists]]
+file = "spam-tlds-folder.json"
+targets = [
+  { profile = "Home",   folder = "Blocked TLDs" },
+  { profile = "Travel", folder = "Blocked TLDs" },
 ]
 ```
 
-If a filename is in `FILE_MAPPINGS` but not in `TARGET_FILES`, Stage 2 will fail to find the file and skip it with an error.
+### Profile and folder names
+
+Names are matched **exactly and case-sensitively** against the Control D account the API token belongs to. Copy them from the dashboard (*Profiles* → profile name; folders are listed inside the profile). Folders must already exist; the scripts never create them. A name that is not found fails that target (logged and shown in the email report) and makes the run fail; the logs deliberately do not list the other names in your account.
+
+### Order and cross-folder deduplication
+
+Within one profile, domains already placed by an earlier `[[lists]]` block are removed from later blocks' desired set, so the same domain is not in two folders. A folder only "claims" its domains if it reconciled successfully. Put allow-list files before block-list files.
+
+### Finding available files
+
+Browse the [`controld/` directory](https://github.com/hagezi/dns-blocklists/tree/main/controld) upstream. Any `*.json` there in the Hagezi Control D folder format (`{"group": …, "rules": [{"PK": "<domain>"}, …]}`) can be used. A filename that does not exist upstream makes Stage 1 fail.
 
 ---
 
-## Schedule
+## Secrets and variables
 
-The workflow runs at 05:00 and 17:00 UTC by default. To change this, edit `.github/workflows/sync-controld.yml`:
+Set under *Settings → Secrets and variables → Actions*. Only the step that needs a value receives it.
+
+### Secrets
+
+| Name | Required | Default | Used by | Description |
+|---|---|---|---|---|
+| `CTRLD_API_TOKEN` | **yes** | – | Stage 2 | Control D API token with **write** access. |
+| `EMAIL_USERNAME` | no | – | Stage 2 | SMTP login and sender address. Email is skipped unless this and `EMAIL_PASSWORD` are both set. |
+| `EMAIL_PASSWORD` | no | – | Stage 2 | SMTP password. For Gmail, an [app password](https://myaccount.google.com/apppasswords), not the account password. |
+| `EMAIL_TO` | no | `EMAIL_USERNAME` | Stage 2 | Recipient of the report. |
+| `GITHUB_TOKEN` | automatic | – | Stages 1 & 3 | Created by GitHub for each run; **do not create it**. Used to authenticate the upstream listing (higher rate limit) and to commit `controld/`. |
+
+### Variables (not secret)
+
+| Name | Default | Description |
+|---|---|---|
+| `EMAIL_SMTP_HOST` | `smtp.gmail.com` | SMTP server. |
+| `EMAIL_SMTP_PORT` | `465` | `465` = implicit TLS; any other port connects in plain text and upgrades with STARTTLS (certificate verified). |
+
+The email report ("Control D sync report") lists, per profile and folder, every domain added, removed, or skipped, plus errors. Email failures are logged but do not fail the run.
+
+---
+
+## Workflow behaviour (`sync-controld.yml`)
+
+| Aspect | Setting |
+|---|---|
+| Triggers | `workflow_dispatch` only. The `schedule:` block is **commented out** (see below). No pull-request triggers. |
+| Input `force_push` | boolean, default `false`. When `true`, Stage 2 runs even if no downloaded file differs from `controld/`. If nothing differs, Stage 3 then commits nothing. |
+| Permissions | `contents: write` only (all other scopes none). |
+| Concurrency | group `controld-sync`; runs queue, an in-progress run is **not** cancelled. |
+| Timeout | 120 minutes. |
+| Step order | checkout → Python 3.14 → `pip install --require-hashes -r requirements.txt` → validate config → Stage 1 → Stage 2 (if changed) → Stage 3 (if changed). |
+| Branch | Stage 3 pushes to the branch the run was started on (`GITHUB_REF_NAME`). Run it from your default branch. |
+
+### Enabling a schedule
+
+Uncomment in `.github/workflows/sync-controld.yml`:
 
 ```yaml
-on:
   schedule:
-    - cron: '0 5  * * *'   # 05:00 UTC
-    - cron: '0 17 * * *'   # 17:00 UTC
+    - cron: '23 5,17 * * *'   # 05:23 and 17:23 UTC daily
 ```
 
-Standard cron syntax applies. [crontab.guru](https://crontab.guru) is useful for building expressions.
+Standard cron syntax, UTC; [crontab.guru](https://crontab.guru) helps. Scheduled runs happen only on the default branch, may be delayed under load (avoid `:00`), and on public repositories are disabled by GitHub after 60 days without repository activity. Finish and manually test your configuration first.
 
-> **Before your first scheduled run**, finish setting up `FILE_MAPPINGS`, `TARGET_FILES`, and the required GitHub secrets. Use **Actions → Sync Control D folders from upstream → Run workflow** to verify everything works before relying on the schedule.
+### Script environment variables
 
----
+Set by the workflow; listed for local debugging.
 
-## Required GitHub secrets
+| Variable | Used by | Meaning |
+|---|---|---|
+| `CONTROLD_SYNC_CONFIG` | both | Path to the config file (default `config.toml`). |
+| `GITHUB_TOKEN`, `GITHUB_REPOSITORY` | Stage 1/3 | Required. |
+| `GITHUB_REF_NAME` | Stage 3 | Branch to push (default `main`). |
+| `GITHUB_OUTPUT` | Stage 1 | Where `changed=true/false` is written. |
+| `FORCE_PUSH` | Stage 1 | `true` forces `changed=true`. |
+| `CTRLD_API_TOKEN` | Stage 2 | Required. |
+| `EMAIL_*` | Stage 2 | See above. |
 
-Set these under **Settings → Secrets and variables → Actions**:
+### Fixed internal values (not configurable without editing the code)
 
-#### 🔑 Required Secrets
-
-| Secret | Value | Description |
-|--------|-------|-------------|
-| `GITHUB_TOKEN` | *(auto-provided)* | Provided automatically by GitHub Actions |
-| `CTRLD_API_TOKEN` | Your Control D API token | Requires **write** permissions. Found in the Control D dashboard under **API**. |
-
-#### ✉️ Email Notification Secrets (optional)
-
-When changes are detected, the workflow can send an email report. Omit any to skip email:
-
-| Secret | Value | Description |
-|--------|-------|-------------|
-| `EMAIL_USERNAME` | Your Gmail address | e.g. `you@gmail.com` — used for SMTP auth, sender, and recipient |
-| `EMAIL_PASSWORD` | Your Gmail App Password | Generate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) — **not** your regular Gmail password |
-
-Gmail's SMTP server (`smtp.gmail.com`, port 465, implicit TLS) is used automatically — no server secret needed.
-
-If `EMAIL_USERNAME` is missing, the email step is skipped silently.
+Upstream API `https://api.github.com/repos/hagezi/dns-blocklists/contents/controld`; Control D API `https://api.controld.com`; synced files directory `controld/`; download retries 5 × 60 s; API retries 3 (2 s, 5 s delays); 500 hostnames per add request; 0.5 s between API calls and 0.25 s between deletions. Downloads are only accepted from `*.githubusercontent.com` (or the Hagezi mirror host).
 
 ---
 
-## First run behaviour
+## First run — important
 
-On the very first run, `controld/` only contains a `.gitkeep` placeholder. Stage 1 will download the files listed in `TARGET_FILES` and treat them as new. Stage 2 will then push all domains in those files to the configured folders — treat this as an initial population, not an incremental diff. Stage 3 commits the files once Stage 2 has succeeded.
+`controld/` starts empty (`.gitkeep` only), so on the first run every configured file counts as new and Stage 2 populates each target folder. Stage 2 always reconciles to the file, so **rules that already exist in a target folder but are not in the Hagezi file are deleted** (subject to `max_delete_percent`). Use empty or disposable folders for the first run. Stage 3 commits the files only after Stage 2 succeeded.
 
-If you already have domains in your Control D folders that are not in the upstream files, they will be removed during the first run (Stage 2 always reconciles to the exact desired state). Make sure your folder contents align with what you expect before the first run, or review the Stage 2 log output carefully.
+Stage 2 is skipped on later runs when no file changed. After changing `config.toml` (new profile, new folder, new list) run the workflow with `force_push` enabled.
 
 ---
 
-## `requirements.txt` — Python dependencies
+## `controld/` directory
 
-`requests` is used by both scripts to make HTTP calls — Stage 1 uses it to download JSON files from the hagezi upstream repo, and Stage 2 uses it to call the Control D API.
+Holds the last successfully applied copy of each configured file. It is the baseline Stage 1 diffs against and is committed by Stage 3. Files for lists you remove from `config.toml` are not deleted automatically, and their Control D folders are left as they are.
 
-`pip` itself is also pinned, so the installer that enforces every other hash is hash-verified too rather than being fetched unpinned from PyPI first.
+---
 
-Dependencies are managed with **[pip-tools](https://pip-tools.readthedocs.io)**:
+## Python dependencies
+
+`requests` is the only direct dependency (both scripts use it). `pip` is also pinned so the installer that enforces the hashes is itself hash-verified.
 
 | File | Purpose |
-|------|---------|
-| `requirements.in` | Human-edited source — list only direct dependencies here |
-| `requirements.txt` | Auto-generated lock file — all packages pinned by version **and** SHA-256 hash |
+|---|---|
+| `requirements.in` | Human-edited: direct dependencies only. |
+| `requirements.txt` | Generated lock file: every package pinned by version **and** SHA-256 hash. |
 
-The workflow installs with `pip install --require-hashes -r requirements.txt`, which means pip will refuse to install any package whose hash does not match. This prevents a compromised or tampered package on PyPI from being silently installed. Because `pip` is one of the pinned entries, that single command also brings pip itself to the pinned version under hash verification — there is no separate `pip install --upgrade pip` step.
+The workflows install with `pip install --require-hashes -r requirements.txt`. To change or refresh pins:
 
-### Manually Updating a dependency
-
-1. Edit `requirements.in` (change the version pin or add/remove a package).
-2. Regenerate the lock file:
-   ```bash
-   pip install pip-tools
-   pip-compile --allow-unsafe --generate-hashes requirements.in -o requirements.txt
-   ```
-   `--allow-unsafe` is required: pip-tools classifies `pip`, `setuptools`, and
-   `distribute` as "unsafe" to pin and will **drop the `pip` pin** without it.
-3. Commit both `requirements.in` and `requirements.txt`.
-4. Update the version entry in the [dependency reference](#-dependency--action-version-reference) below.
-
-> **Note:** pip-tools uses pip's internals, so a very new `pip` in your local
-> environment can break `pip-compile` itself (pip-tools 7.6.0 fails against pip
-> 26.x). If regeneration errors out, run it in a venv with an older pip. This
-> only affects manual regeneration — Dependabot uses its own environment.
-
----
-
-## 📦 Dependency & action version reference
-
-> **Dependabot handles updates automatically.**
-> `.github/dependabot.yml` is configured to open weekly PRs (every Monday at 06:00 UTC) for both GitHub Actions pins and Python pip dependencies. You do not need to chase versions manually — just review and merge the Dependabot PRs when they arrive.
-
-The entries below are kept for **transparency**: they document the version and commit hash that was current when each dependency was last manually reviewed, along with links to upstream release pages. Commit hashes are used for Actions (instead of tags) to prevent supply-chain attacks where a tag is silently moved to a different commit.
-
-### Python packages
-
-Versions below reflect the current `requirements.in` pin. All transitive
-dependencies are locked with SHA-256 hashes in `requirements.txt` — run
-`pip-compile --allow-unsafe --generate-hashes` after any change (see above).
-
-```yaml
-# - package: "requests"
-#   url: "https://pypi.org/project/requests/"
-#   version: "2.34.2"
-#   date: "2026-05-14"
-#   transitive-deps: "certifi, charset-normalizer, idna, urllib3"
-
-# - package: "pip"
-#   url: "https://pypi.org/project/pip/"
-#   version: "26.2.1"
-#   date: "2026-08-04"
-#   note: "pip-tools 'unsafe' package — needs --allow-unsafe to stay pinned"
+```bash
+pip install pip-tools
+pip-compile --allow-unsafe --generate-hashes requirements.in -o requirements.txt
+# add --upgrade to also refresh transitive packages (certifi, urllib3, idna, charset-normalizer)
 ```
 
-### GitHub Actions
+`--allow-unsafe` is required: pip-tools otherwise drops the `pip` pin.
 
-Dates below are the commit date of the pinned SHA.
+## Automated maintenance
 
-```yaml
-# - action: "actions/checkout"
-#   url: "https://github.com/actions/checkout/releases"
-#   version: "v7.0.1"
-#   date: "2026-07-17"
-#   commit: "3d3c42e5aac5ba805825da76410c181273ba90b1"
+- **Dependabot** (`.github/dependabot.yml`): weekly (Monday 06:00 UTC), one grouped PR per ecosystem — GitHub Actions pins (commit SHAs) and pip. New releases are proposed after a 3-day cooldown; security updates are not delayed. Dependabot updates the direct dependency (`requests`) and the `uses:` SHAs; it may not bump transitive pins, so run `pip-compile --upgrade` occasionally.
+- **CI** (`.github/workflows/ci.yml`): on pull requests and pushes to `main`: `compileall`, validation of `config.example.toml`, `python -m unittest discover -s tests`. Read-only token, no secrets.
+- Action versions in use are the `uses:` lines of the workflow files (the trailing `# vX.Y.Z` comment names the release each SHA corresponds to).
 
-# - action: "actions/setup-python"
-#   url: "https://github.com/actions/setup-python/releases"
-#   python-releases: "https://www.python.org/downloads/source/"
-#   version: "v7.0.0"
-#   date: "2026-07-19"
-#   commit: "5fda3b95a4ea91299a34e894583c3862153e4b97"
-#   with:
-#     python-version: "3.14"
+## `clear-actions.yml` (optional)
 
-# - action: "Mattraks/delete-workflow-runs"
-#   url: "https://github.com/Mattraks/delete-workflow-runs/releases"
-#   version: "v2.1.0"
-#   date: "2026-03-27"
-#   commit: "b3018382ca039b53d238908238bd35d1fb14f8ee"
-```
-
-To manually update an action (outside of a Dependabot PR): find the new release tag and its corresponding full commit hash on the action's GitHub releases page, update the `uses:` line in `.github/workflows/sync-controld.yml` to the new commit hash, and update the entry above.
+Deletes old workflow runs with [Mattraks/delete-workflow-runs](https://github.com/Mattraks/delete-workflow-runs) (pinned SHA). Manual only; uncomment its `schedule:` to automate it. Permissions: `actions: write`, `contents: read`. Settings in the file: `retain_days: 30`, `keep_minimum_runs: 5`. Logs are the audit trail of what the sync did, so keep `retain_days` generous.

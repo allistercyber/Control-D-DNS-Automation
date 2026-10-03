@@ -1,0 +1,46 @@
+name: CI
+
+# Safety checks only: no secrets, no Control D access, read-only token.
+# Runs on pull requests (including Dependabot's) and on pushes to the default
+# branch, so dependency and Action updates are validated before merging.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install --require-hashes -r requirements.txt
+
+      - name: Compile scripts
+        run: python -m compileall -q scripts tests
+
+      - name: Validate example configuration
+        run: python scripts/controld_config.py config.example.toml
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
