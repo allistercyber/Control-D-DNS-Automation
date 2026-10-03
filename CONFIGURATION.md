@@ -22,21 +22,21 @@ This page has two parts. **[Start here](#start-here-what-this-does-in-plain-engl
 
 - [ ] A free GitHub account.
 - [ ] A Control D account.
-- [ ] A Control D profile, with **empty folders** already created in it. The scripts never create profiles or folders.
-- [ ] A Control D API token with **write** access (Control D dashboard, API section).
+- [ ] A Control D profile, with **empty folders** already created in it, one per list. The scripts never create profiles or folders. Give each folder the action that matches its list: **Block** for the block lists, **Bypass** (allow) for the `*-allow-folder.json` lists. Control D makes every rule in a folder inherit the folder's action.
+- [ ] A Control D API token with **write** access and **no Allowed IPs restriction**. Create it at [controld.com/dashboard/api](https://controld.com/dashboard/api): click **+**, name it, choose **Write**, leave **Allowed IPs** empty. GitHub's runners use changing addresses, so an IP-restricted token is rejected.
 
 ### Quick start
 
-1. **Fork this repository and make your copy private.** If GitHub will not let you switch a fork to private, create a new private repository and push a copy of this one into it. Open the *Actions* tab of your copy and confirm that you want to enable workflows. Details: [README step 1](README.md#1-fork-or-copy-the-repository).
+1. **Make your own private copy of this repository.** A fork of a public repository cannot be made private, so use the *Use this template* button (if shown) or duplicate it with git, as described in [README step 1](README.md#1-make-your-own-private-copy). If you fork anyway, the copy is public, and you must open its *Actions* tab and confirm that you want to enable workflows.
 2. **Copy `config.example.toml` to `config.toml` and replace the example names** with your real profile and folder names, then commit the file. The workflow reads the committed copy. Details: [`config.toml`](#configtoml).
-3. **Run the offline check** (needs Python 3.11 or newer; makes no network calls): `python scripts/controld_config.py config.toml`. On success it prints a line starting `Configuration OK:`. Otherwise it prints `ERROR:` and what to fix. Details: [`config.toml`](#configtoml).
+3. **Check the file.** Either run the offline check (needs Python 3.11 or newer; makes no network calls): `python scripts/controld_config.py config.toml`, which prints a line starting `Configuration OK:` on success, or `ERROR:` and what to fix. Or skip Python: commit the file and look at the **CI** run under the *Actions* tab, which runs the same check and shows a red cross with the reason if the file is wrong. Details: [`config.toml`](#configtoml).
 4. **Add the `CTRLD_API_TOKEN` secret** in *Settings → Secrets and variables → Actions*. Details: [Secrets and variables](#secrets-and-variables).
 5. **Run the workflow once by hand on an empty test folder**: *Actions → Sync Control D folders from upstream → Run workflow*. Check the folder in Control D afterwards. Read [First run](#first-run--important) first. Details: [README step 4](README.md#4-run-it-manually).
 6. **Only then turn on the schedule.** Details: [Enabling a schedule](#enabling-a-schedule).
 
 ### How it keeps your DNS safe
 
-- It refuses to apply a file that is empty, has no `rules` list, or cannot be read. That file is skipped and the run is marked as failed.
+- It refuses to apply a file that is empty, has no `rules` list, cannot be read, or has a rule whose block/allow action is missing or unsupported. That file is skipped and the run is marked as failed.
 - It stops syncing a folder if the sync would remove more than `max_delete_percent` of the rules the folder currently has (default 50). The folder is left untouched and the run is marked as failed. This check only applies to folders that already contain rules. See [`[settings]`](#settings-optional-table).
 - Nothing runs on a schedule until you enable it. By default the workflow only runs when you press *Run workflow*.
 - Your repository is updated with the new files only after Control D was updated without errors. If a run fails, the next run tries again.
@@ -46,7 +46,7 @@ This page has two parts. **[Start here](#start-here-what-this-does-in-plain-engl
 - The folder is made to match the file **exactly**. Rules you added to that folder by hand are removed.
 - Names are case-sensitive and must match Control D exactly, including spaces.
 - After editing `config.toml`, run the workflow with **force_push** switched on. Otherwise nothing is pushed unless a Hagezi file has changed.
-- Keep your fork private. The workflow logs and `config.toml` show which profiles, folders and lists you use.
+- Keep your copy private (a fork of this public repository cannot be). The workflow logs and `config.toml` show which profiles, folders and lists you use.
 - The optional email report lists every domain that was added or removed.
 - In `config.toml`, put allow-list entries **before** block-list entries. If the same domain is in two lists for one profile, the earlier entry keeps it.
 
@@ -61,8 +61,10 @@ Open the failed run in the *Actions* tab and read the log of the step that has t
 | Nothing happened after you edited `config.toml` | The push step only runs when a downloaded file differs from the copy in `controld/`. The *Sync files from upstream* log then says `No changes detected.` Also check that you committed `config.toml`: the workflow does not see local edits. | Commit and push `config.toml`, then run the workflow with **force_push** switched on. |
 | No email arrived | Email is skipped unless both `EMAIL_USERNAME` and `EMAIL_PASSWORD` are set. The report is also sent only when the push step runs, so a run with no changes sends nothing. If the API token is wrong, the profile list cannot be fetched and the log says `No email body found — skipping email send`. A mail server problem is logged as `Failed to send email:` and does not fail the run. | Set both secrets (for Gmail use an app password), check the log of the push step, and use **force_push** to test. See [Secrets and variables](#secrets-and-variables). |
 | The push step logs `Aborting sync for '…'` and `exceeds the … safety threshold` | The sync would remove more of the folder's rules than `max_delete_percent` allows, often because the folder holds hand-made rules or is not the folder you meant. | Check the folder. If the removal is intended, raise `max_delete_percent` in `config.toml`, then run again. |
-| The sync step logs `File not found in upstream: …` | The `file` name does not exist in Hagezi's `controld/` folder, or is misspelled. The step retries for several minutes before it gives up. | Pick a name from the [upstream list](https://github.com/hagezi/dns-blocklists/tree/main/controld). |
-| The push step logs `CTRLD_API_TOKEN environment variable is not set or empty` or `Cannot fetch profiles` | The secret is missing or misspelled, or the token is invalid. | Re-add the `CTRLD_API_TOKEN` secret with a token that has write access. |
+| The sync step logs `File not found in upstream: …` | The `file` name does not exist in Hagezi's `controld/` folder, or is misspelled. The step stops at once (no retries, no mirror) and lists the closest real names, for every misspelled file in one go. | Copy the suggested name, or pick one from the [upstream list](https://github.com/hagezi/dns-blocklists/tree/main/controld). |
+| The push step logs `CTRLD_API_TOKEN environment variable is not set or empty` or `Cannot fetch profiles` | The secret is missing or misspelled, the token is invalid, or the token was created with **Allowed IPs** (GitHub's runners do not have a fixed address). | Create a new token with **Write** access and **no Allowed IPs** at [controld.com/dashboard/api](https://controld.com/dashboard/api), then re-add the `CTRLD_API_TOKEN` secret. |
+| The push step logs `has a missing or unsupported action` or `repeats a hostname with a different action` | The upstream file uses something this project does not handle (only block and allow rules are supported) or is corrupted. The file is skipped and the run fails. | Don't use that file, and open an issue if it is a normal Hagezi file. |
+| The *Commit synced files* step fails with a 403 or `protected branch` | The Control D update already succeeded. Your repository forbids the workflow from pushing: *Settings → Actions → General → Workflow permissions*, an organization policy, or branch protection on the branch you ran from. | Allow the workflow to write to that branch (or unprotect it). The next run re-applies the same change harmlessly and commits it. |
 
 ### Glossary
 
@@ -147,7 +149,9 @@ Within one profile, domains already placed by an earlier `[[lists]]` block are r
 
 ### Finding available files
 
-Browse the [`controld/` directory](https://github.com/hagezi/dns-blocklists/tree/main/controld) upstream. Any `*.json` there in the Hagezi Control D folder format (`{"group": …, "rules": [{"PK": "<domain>"}, …]}`) can be used. A filename that does not exist upstream makes Stage 1 fail.
+Browse the [`controld/` directory](https://github.com/hagezi/dns-blocklists/tree/main/controld) upstream. Any `*.json` there in the Hagezi Control D folder format (`{"group": …, "rules": [{"PK": "<domain>", "action": {"do": 0, "status": 1}}, …]}`) can be used. A filename that does not exist upstream makes Stage 1 fail immediately.
+
+Each rule's `action.do` is `0` (block) or `1` (bypass/allow), and the push creates the rule with exactly that action. Files named `*-allow-folder.json` hold allow rules; the other files hold block rules, except `spam-tlds-combined-folder.json`, which mixes about a thousand allow rules and a few hundred block rules in one file. A Control D folder applies one action to everything in it, so for that content prefer the separate `spam-tlds-folder.json` and `spam-tlds-allow-folder.json` files in two folders. Anything other than `do` 0/1 and `status` 0/1 (for example spoof or redirect) makes the file be refused.
 
 ---
 
@@ -215,7 +219,7 @@ Set by the workflow; listed for local debugging.
 
 ### Fixed internal values (not configurable without editing the code)
 
-Upstream API `https://api.github.com/repos/hagezi/dns-blocklists/contents/controld`; Control D API `https://api.controld.com`; synced files directory `controld/`; download retries 5 × 60 s; API retries 3 (2 s, 5 s delays); 500 hostnames per add request; 0.5 s between API calls and 0.25 s between deletions. Downloads are only accepted from `*.githubusercontent.com` (or the Hagezi mirror host).
+Upstream API `https://api.github.com/repos/hagezi/dns-blocklists/contents/controld`; Control D API `https://api.controld.com`; synced files directory `controld/`; download retries 5 × 60 s (not for a file name that does not exist upstream, which fails at once); API retries 3 (2 s, 5 s delays); 500 hostnames per add request; 0.5 s between API calls and 0.25 s between deletions. Downloads are only accepted from `*.githubusercontent.com` (or the Hagezi mirror host).
 
 ---
 
@@ -255,7 +259,7 @@ pip-compile --allow-unsafe --generate-hashes requirements.in -o requirements.txt
 ## Automated maintenance
 
 - **Dependabot** (`.github/dependabot.yml`): weekly (Monday 06:00 UTC), one grouped PR per ecosystem — GitHub Actions pins (commit SHAs) and pip. New releases are proposed after a 3-day cooldown; security updates are not delayed. Dependabot updates the direct dependency (`requests`) and the `uses:` SHAs; it may not bump transitive pins, so run `pip-compile --upgrade` occasionally.
-- **CI** (`.github/workflows/ci.yml`): on pull requests and pushes to `main`: `compileall`, validation of `config.example.toml`, `python -m unittest discover -s tests`. Read-only token, no secrets.
+- **CI** (`.github/workflows/ci.yml`): on pull requests and pushes to `main`: `compileall`, validation of `config.example.toml` and of your `config.toml` if one is committed, `python -m unittest discover -s tests`. Read-only token, no secrets. The unit tests replace the Control D API and the upstream download with in-memory fakes, so they prove the scripts' own logic but cannot prove what the live API accepts; that is what the manual first run on a test folder is for.
 - Action versions in use are the `uses:` lines of the workflow files (the trailing `# vX.Y.Z` comment names the release each SHA corresponds to).
 
 ## `clear-actions.yml` (optional)

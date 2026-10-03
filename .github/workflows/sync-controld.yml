@@ -4,11 +4,11 @@ name: Sync Control D folders from upstream
 # Manual only.  This workflow ships with NO cron schedule so that it never runs
 # on its own in the upstream template repository.
 #
-# To run it automatically in YOUR fork, once config.toml and the secrets are in
+# To run it automatically in YOUR copy, once config.toml and the secrets are in
 # place and a manual run has succeeded, uncomment the `schedule:` block below
 # and adjust the times (UTC).  Pick an off-peak minute rather than :00 -- GitHub
 # delays or drops scheduled runs at the top of the hour when load is high.
-# See README.md, "Enable scheduled runs in your fork".
+# See README.md, "Enable scheduled runs in your copy".
 on:
   workflow_dispatch:
     inputs:

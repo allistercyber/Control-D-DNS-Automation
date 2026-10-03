@@ -1,6 +1,6 @@
 # Control D sync configuration -- EXAMPLE
 #
-# Copy this file to `config.toml` in your fork and edit it.  The workflow reads
+# Copy this file to `config.toml` in your copy and edit it.  The workflow reads
 # `config.toml` only; this example is never used at runtime.  Every profile and
 # folder name below is a placeholder and will not exist in your account.
 #

@@ -30,6 +30,7 @@ import os
 import sys
 import time
 import shutil
+import difflib
 import subprocess
 import base64
 from pathlib import Path
@@ -69,6 +70,10 @@ ALLOWED_MIRROR_HOST   = "hagezi-mirror.dnsbunker.org"
 
 
 # ── Sync class ────────────────────────────────────────────────────────────────
+
+class UpstreamFileMissing(Exception):
+    """A configured file does not exist upstream.  Retrying cannot fix that."""
+
 
 class ControldSync:
 
@@ -131,9 +136,16 @@ class ControldSync:
         Download the configured files from the GitHub upstream, falling back to the
         mirror if GitHub is unreachable after all retry attempts.
         Returns True on success, False if both sources fail.
+
+        A configured file that does not exist upstream (a typo in config.toml)
+        fails immediately: retrying, or asking the mirror for the same name,
+        would only delay the error message by several minutes.
         """
-        if self._download_from_github(github_token):
-            return True
+        try:
+            if self._download_from_github(github_token):
+                return True
+        except UpstreamFileMissing:
+            return False
 
         if not self.mirror_fallback:
             print("GitHub upstream unavailable after all attempts; mirror fallback is disabled.")
@@ -166,17 +178,33 @@ class ControldSync:
                 response = requests.get(UPSTREAM_API_URL, headers=api_headers, timeout=30)
                 response.raise_for_status()
 
-                # Download only the files we care about
                 upstream_files = {
                     f["name"]: f["download_url"]
                     for f in response.json()
-                    if f.get("type") == "file" and f.get("name") in self.target_files
+                    if f.get("type") == "file" and f.get("name")
                 }
 
+                # An empty listing is a GitHub hiccup, not proof that every file
+                # is gone: let it be retried (and fall back to the mirror).
+                if not upstream_files:
+                    raise ValueError("upstream directory listing was empty")
+
+                # Report every missing name at once, with the closest upstream
+                # names, so one run is enough to fix all the typos.
+                missing = [n for n in self.target_files if not upstream_files.get(n)]
+                if missing:
+                    for name in missing:
+                        close = difflib.get_close_matches(name, upstream_files, n=3)
+                        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+                        print(
+                            f"ERROR: File not found in upstream: {name}. Check the "
+                            f"'file' value in config.toml.{hint}"
+                        )
+                    raise UpstreamFileMissing(", ".join(missing))
+
+                # Download only the files we care about
                 for filename in self.target_files:
-                    url = upstream_files.get(filename)
-                    if not url:
-                        raise ValueError(f"File not found in upstream: {filename}")
+                    url = upstream_files[filename]
                     # Validate the download URL before fetching to prevent SSRF
                     # in case the GitHub API response is tampered with.
                     # Use .hostname (not .netloc): netloc also carries any
@@ -204,6 +232,8 @@ class ControldSync:
                 print("Download successful.")
                 return True
 
+            except UpstreamFileMissing:
+                raise
             except requests.RequestException as exc:
                 print(f"Network error on attempt {attempt}: {exc}")
             except Exception as exc:
