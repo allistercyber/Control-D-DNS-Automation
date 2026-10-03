@@ -4,7 +4,7 @@ name: Cleanup Old Workflow Runs
 # Optional housekeeping, manual only.  Like the sync workflow it ships with no
 # cron schedule, so nothing runs automatically in the upstream template.
 #
-# To run it daily in your fork, uncomment the `schedule:` block below.
+# To run it daily in your copy, uncomment the `schedule:` block below.
 on:
   workflow_dispatch:
   # schedule:

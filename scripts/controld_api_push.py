@@ -4,7 +4,8 @@ Stage 2 — Control D API push.
 
 For each monitored JSON file that changed, reconciles the matching Control D
 folder against the desired state (file on disk) by:
-  - Adding domains present in the file but missing from the live folder.
+  - Adding domains present in the file but missing from the live folder, each
+    with the action the file gives it (block or bypass/allow).
   - Removing domains present in the live folder but absent from the file.
 
 Reconciliation is based on the LIVE API state, not git history, so the
@@ -58,6 +59,15 @@ BASE_URL           = "https://api.controld.com"
 PAGE_SIZE          = 500    # max hostnames per POST /rules batch request
 REQUEST_DELAY      = 0.5    # seconds between API calls (rate-limit headroom)
 DELETE_DELAY       = 0.25   # seconds between individual DELETE calls
+
+# A rule's action as Control D models it: (do, status).
+#   do:     0 = block, 1 = bypass (allow)
+#   status: 0 = disabled, 1 = enabled
+# Spoof (2) and redirect (3) need a target the upstream files do not carry, so
+# a file using them is refused rather than guessed at.
+Action           = Tuple[int, int]
+SUPPORTED_DO     = (0, 1)
+SUPPORTED_STATUS = (0, 1)
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
@@ -127,9 +137,13 @@ def fetch_live_hostnames(profile_pk: str, folder_pk: str, api_token: str) -> Set
     """Returns the set of hostnames currently live in a Control D folder."""
     data = _get(f"{BASE_URL}/profiles/{profile_pk}/rules/{folder_pk}", api_token)
     body = data.get("body", data)          # handle both API response shapes
-    rules = body.get("rules", [])
+    # Error responses carry "body": [] -- treat anything but an object as a
+    # failed fetch rather than as an empty folder (which would look like
+    # "nothing to delete" and then re-add everything).
+    if not isinstance(body, dict):
+        raise requests.RequestException("unexpected response shape for folder rules")
     hostnames: Set[str] = set()
-    for rule in rules:
+    for rule in body.get("rules", []):
         h = rule.get("PK", "").strip().lower()
         if h:
             hostnames.add(h)
@@ -142,17 +156,19 @@ def add_hostnames_batch(
     folder_pk: str,
     hostnames: List[str],
     api_token: str,
+    action: Action = (0, 1),
 ) -> int:
     """
-    POSTs hostnames to a Control D folder in batches of PAGE_SIZE.
-    action.do=0 means 'inherit action from folder'.
+    POSTs hostnames to a Control D folder in batches of PAGE_SIZE, all with the
+    same `action` (do, status): 0 = block, 1 = bypass (allow).
     Returns the total count of hostnames sent.
     """
+    do, status = action
     total = 0
     for i in range(0, len(hostnames), PAGE_SIZE):
         chunk = hostnames[i : i + PAGE_SIZE]
         payload = {
-            "action":    {"do": 0, "status": 1},
+            "action":    {"do": do, "status": status},
             "group":     folder_pk,
             "hostnames": chunk,
         }
@@ -213,17 +229,46 @@ def delete_hostname(profile_pk: str, hostname: str, api_token: str) -> None:
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
-def extract_desired_hostnames(file_path: str) -> Optional[Set[str]]:
+def _valid(value: object, allowed: Tuple[int, ...]) -> bool:
+    # bool is an int subclass in Python; reject it explicitly.
+    return isinstance(value, int) and not isinstance(value, bool) and value in allowed
+
+
+def _resolve_action(rule_action: object, group_action: object) -> Optional[Action]:
     """
-    Parses a Hagezi Control D folder JSON and returns the set of hostnames.
+    The (do, status) for one rule: each field comes from the rule's own
+    "action" object, falling back to the folder-level ("group") one.  Returns
+    None if either field is missing or unsupported -- never a guess, because
+    guessing "block" for an allow rule (or the reverse) is exactly the mistake
+    this check exists to prevent.
+    """
+    do = status = None
+    for source in (rule_action, group_action):
+        if isinstance(source, dict):
+            if do is None:
+                do = source.get("do")
+            if status is None:
+                status = source.get("status")
+    if _valid(do, SUPPORTED_DO) and _valid(status, SUPPORTED_STATUS):
+        return do, status
+    return None
+
+
+def extract_desired_rules(file_path: str) -> Optional[Dict[str, Action]]:
+    """
+    Parses a Hagezi Control D folder JSON and returns {hostname: (do, status)}.
 
     Hagezi format:
       {
         "group": {"group": "...", "action": {"do": N, "status": 1}},
-        "rules": [{"PK": "example.com", "action": {...}}, ...]
+        "rules": [{"PK": "example.com", "action": {"do": N, "status": 1}}, ...]
       }
 
-    Returns None if the file is missing or unparseable.
+    The file is untrusted input (it comes from upstream or a mirror), so every
+    unexpected shape makes the whole file be refused instead of crashing the
+    run or silently dropping rules.  Hostnames are never logged, only positions.
+
+    Returns None if the file is missing, unparseable or not trustworthy.
     """
     try:
         with open(file_path, "r", encoding="utf-8") as fh:
@@ -231,29 +276,51 @@ def extract_desired_hostnames(file_path: str) -> Optional[Set[str]]:
     except FileNotFoundError:
         log.error(f"File not found: {file_path}")
         return None
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         log.error(f"JSON parse error in {file_path}: {exc}")
         return None
 
-    rules = data.get("rules")
-    if rules is None:
-        log.error(f"Missing 'rules' key in {file_path} — refusing to sync (would wipe folder)")
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        log.error(
+            f"Missing or invalid 'rules' list in {file_path} — refusing to sync "
+            f"(would wipe folder)"
+        )
         return None
 
-    hostnames: Set[str] = set()
-    for rule in rules:
-        h = rule.get("PK", "").strip().lower()
-        if h:
-            hostnames.add(h)
+    group = data.get("group")
+    group_action = group.get("action") if isinstance(group, dict) else None
 
-    if not hostnames:
+    desired: Dict[str, Action] = {}
+    for position, rule in enumerate(data["rules"], start=1):
+        pk = rule.get("PK") if isinstance(rule, dict) else None
+        if not isinstance(pk, str):
+            log.error(f"Rule #{position} in {file_path} has no string 'PK' — refusing to sync")
+            return None
+        hostname = pk.strip().lower()
+        if not hostname:
+            continue
+        action = _resolve_action(rule.get("action"), group_action)
+        if action is None:
+            log.error(
+                f"Rule #{position} in {file_path} has a missing or unsupported action "
+                f"(only do 0/1 and status 0/1 are supported) — refusing to sync"
+            )
+            return None
+        if desired.setdefault(hostname, action) != action:
+            log.error(
+                f"Rule #{position} in {file_path} repeats a hostname with a different "
+                f"action — refusing to sync"
+            )
+            return None
+
+    if not desired:
         log.error(
             f"No hostnames extracted from {file_path} — refusing to treat empty set as "
             f"desired state (would wipe folder). Skipping."
         )
         return None
 
-    return hostnames
+    return desired
 
 
 # ── Folder reconciliation ─────────────────────────────────────────────────────
@@ -262,13 +329,15 @@ def sync_folder(
     profile_pk: str,
     folder_pk: str,
     folder_name: str,
-    desired: Set[str],
+    desired: Dict[str, Action],
     api_token: str,
     max_delete_percent: int,
 ) -> Tuple[bool, List[str], List[str]]:
     """
-    Reconciles a single Control D folder to match `desired`.
-    Fetches live state, then adds/removes the delta.
+    Reconciles a single Control D folder to match `desired` ({hostname: action}).
+    Fetches live state, then adds/removes the delta.  Hostnames are compared by
+    name only: a rule already in the folder is left alone even if its live
+    action differs from the file's.
     Returns (success, actually_added, actually_removed).
     """
     log.info(f"  Reconciling folder '{folder_name}' (pk={folder_pk})")
@@ -281,8 +350,8 @@ def sync_folder(
         log.error(f"  Failed to fetch live rules for '{folder_name}': {exc}")
         return False, [], []
 
-    to_add    = sorted(desired - live)
-    to_remove = sorted(live - desired)
+    to_add    = sorted(set(desired) - live)
+    to_remove = sorted(live - set(desired))
 
     log.info(f"  Delta: +{len(to_add)} to add, -{len(to_remove)} to remove")
 
@@ -305,11 +374,16 @@ def sync_folder(
     actually_added:   List[str] = []
     actually_removed: List[str] = []
 
-    # Additions (batched)
+    # Additions (batched, one run of batches per distinct action)
     if to_add:
+        by_action: Dict[Action, List[str]] = {}
+        for hostname in to_add:
+            by_action.setdefault(desired[hostname], []).append(hostname)
         try:
-            add_hostnames_batch(profile_pk, folder_pk, to_add, api_token)
-            actually_added = to_add
+            for action, hostnames in sorted(by_action.items()):
+                add_hostnames_batch(profile_pk, folder_pk, hostnames, api_token, action)
+                actually_added.extend(hostnames)
+            actually_added.sort()
             log.info(f"  Added {len(actually_added)} domains to '{folder_name}'")
         except requests.HTTPError as exc:
             # Log only the status code — response body may contain internal API
@@ -395,13 +469,17 @@ def run(api_token: str, config: Config) -> Tuple[bool, str]:
         file_path = f"{CONTROLD_DIR}/{filename}"
         log.info(f"\n📄 File: {filename}")
 
-        desired = extract_desired_hostnames(file_path)
+        desired = extract_desired_rules(file_path)
         if desired is None:
             log.error(f"  Skipping '{filename}' — could not read/parse file")
             overall_success = False
             continue
 
-        log.info(f"  Desired state: {len(desired)} hostnames")
+        n_allow = sum(1 for do, _ in desired.values() if do == 1)
+        log.info(
+            f"  Desired state: {len(desired)} hostnames "
+            f"({len(desired) - n_allow} block, {n_allow} allow)"
+        )
 
         for (profile_name, folder_name) in mappings:
             log.info(f"  → Target: profile='{profile_name}', folder='{folder_name}'")
@@ -433,7 +511,10 @@ def run(api_token: str, config: Config) -> Tuple[bool, str]:
             # Cross-folder deduplication: exclude domains already claimed by
             # an earlier folder in this profile (allow before block).
             already_claimed  = claimed_per_profile.get(profile_name, set())
-            effective_desired = desired - already_claimed
+            effective_desired = {
+                host: action for host, action in desired.items()
+                if host not in already_claimed
+            }
             n_skipped = len(desired) - len(effective_desired)
 
             if n_skipped:
@@ -450,7 +531,7 @@ def run(api_token: str, config: Config) -> Tuple[bool, str]:
             # max_delete_percent guardrail — the later folder would then treat
             # them as unwanted and delete them, leaving them in no folder at all.
             if ok:
-                claimed_per_profile.setdefault(profile_name, set()).update(effective_desired)
+                claimed_per_profile.setdefault(profile_name, set()).update(effective_desired.keys())
 
             if not ok:
                 overall_success = False

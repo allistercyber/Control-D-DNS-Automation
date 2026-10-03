@@ -42,5 +42,16 @@ jobs:
       - name: Validate example configuration
         run: python scripts/controld_config.py config.example.toml
 
+      # Catches a broken config.toml as soon as it is committed, rather than the
+      # first time the sync is run.  Offline, like the check above.  The upstream
+      # template ships no config.toml, so there it is skipped.
+      - name: Validate config.toml (if present)
+        run: |
+          if [ -f config.toml ]; then
+            python scripts/controld_config.py config.toml
+          else
+            echo "No config.toml in this repository - nothing to validate."
+          fi
+
       - name: Unit tests
         run: python -m unittest discover -s tests -v
