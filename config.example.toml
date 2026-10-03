@@ -1,0 +1,45 @@
+# Control D sync configuration -- EXAMPLE
+#
+# Copy this file to `config.toml` in your fork and edit it.  The workflow reads
+# `config.toml` only; this example is never used at runtime.  Every profile and
+# folder name below is a placeholder and will not exist in your account.
+#
+# Full reference: CONFIGURATION.md
+# Validate without network access:  python scripts/controld_config.py config.toml
+
+# ── Optional settings (the values shown are the defaults) ───────────────────
+
+[settings]
+# Safety guardrail: abort a folder's sync if it would delete more than this
+# percentage of the folder's live rules (integer, 1-100).
+max_delete_percent = 50
+
+# If github.com is unreachable after all retries, download the files from the
+# official Hagezi build mirror (hagezi-mirror.dnsbunker.org) instead.
+# Set to false to only ever use GitHub.
+mirror_fallback = true
+
+# ── Lists to sync ───────────────────────────────────────────────────────────
+#
+# One [[lists]] block per upstream file.  `file` is a filename from
+#   https://github.com/hagezi/dns-blocklists/tree/main/controld
+# and `targets` lists the Control D profile/folder pairs that mirror it.
+# Names are case-sensitive and must match your Control D account exactly.
+# The folders must already exist; the scripts never create them.
+#
+# Order matters: within one profile, domains claimed by an earlier block are
+# skipped by later blocks, so put allow-list folders before block-list folders.
+# A given profile/folder pair may appear in only one block.
+
+[[lists]]
+file = "apple-private-relay-allow-folder.json"
+targets = [
+  { profile = "Example Profile", folder = "Example Allow Folder" },
+]
+
+[[lists]]
+file = "spam-tlds-folder.json"
+targets = [
+  { profile = "Example Profile",   folder = "Example Block Folder" },
+  { profile = "Example Profile 2", folder = "Example Block Folder" },
+]

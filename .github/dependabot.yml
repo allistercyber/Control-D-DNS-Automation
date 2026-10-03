@@ -1,8 +1,13 @@
+# Maintenance automation: keeps GitHub Actions pins and the hash-locked Python
+# dependencies current.  This file is generic and safe to keep in forks.
+# There are no other package ecosystems or separate dev dependencies in this
+# repository (the tests use only the standard library).
 version: 2
 
 updates:
-  # ── GitHub Actions ────────────────────────────────────────────────────────────
-  # Keeps action pins (commit SHAs) up to date.
+  # ── GitHub Actions ─────────────────────────────────────────────────────────
+  # Workflow `uses:` lines are pinned to commit SHAs; Dependabot bumps the SHA
+  # (and the trailing "# vX.Y.Z" comment) when a new release appears.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -10,13 +15,22 @@ updates:
       day: monday
       time: "06:00"
       timezone: UTC
+    # Wait a few days after a release before proposing it, so a compromised or
+    # yanked release is less likely to be picked up.  Security updates ignore this.
+    cooldown:
+      default-days: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "ci(deps)"
     labels:
       - dependencies
 
-  # ── Python (pip) ──────────────────────────────────────────────────────────────
-  # Keeps requirements.txt versions and SHA-256 hashes up to date.
+  # ── Python (pip) ───────────────────────────────────────────────────────────
+  # Keeps requirements.txt versions and SHA-256 hashes up to date
+  # (requirements.in is the pip-compile source).
   - package-ecosystem: pip
     directory: /
     schedule:
@@ -24,6 +38,12 @@ updates:
       day: monday
       time: "06:00"
       timezone: UTC
+    cooldown:
+      default-days: 3
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "build(deps)"
     labels:

@@ -1,63 +1,36 @@
 name: Cleanup Old Workflow Runs
 
+# ── Triggers ─────────────────────────────────────────────────────────────────
+# Optional housekeeping, manual only.  Like the sync workflow it ships with no
+# cron schedule, so nothing runs automatically in the upstream template.
+#
+# To run it daily in your fork, uncomment the `schedule:` block below.
 on:
-  schedule:
-    - cron: '0 0 * * *'  # Every day at midnight
   workflow_dispatch:
+  # schedule:
+  #   - cron: '41 0 * * *'   # daily at 00:41 UTC
 
 concurrency:
   group: clear-actions
   cancel-in-progress: false
 
+# actions: write is required to delete workflow runs; nothing else is needed.
 permissions:
-  actions: write      # ✅ Required to delete workflow runs
-  contents: read      # ✅ Minimum needed to access repo contents
+  actions: write
+  contents: read
 
 jobs:
   delete-runs:
-    if: github.repository != 'allistercyber/Control-D-DNS-Automation'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@b3018382ca039b53d238908238bd35d1fb14f8ee
+        uses: Mattraks/delete-workflow-runs@b3018382ca039b53d238908238bd35d1fb14f8ee # v2.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          # Workflow logs are the only forensic record of what this automation
-          # did — every commit pushed and every domain added/removed from DNS
-          # filtering.  retain_days: 0 deleted that trail daily, leaving no
-          # window to investigate a bad sync.  30 days keeps the Actions tab
-          # tidy while preserving a usable audit history.
-          retain_days: 7
+          # Workflow logs are the only forensic record of what the sync did --
+          # every commit pushed to the repo.  Keep them long enough to
+          # investigate a bad sync (a value of 0 would wipe that trail).
+          retain_days: 30
           keep_minimum_runs: 5
-
-
-
-# GitHub Actions Version Reference
-# Dates are the commit date of the pinned SHA.
-# versions:
-#  - action: "Mattraks/delete-workflow-runs"
-#    url: "https://github.com/Mattraks/delete-workflow-runs/releases"
-#    version: "v2.1.0"
-#    date: "2026-03-27"
-#    commit: "b3018382ca039b53d238908238bd35d1fb14f8ee"
-#
-# - package: "requests"
-#   url: "https://pypi.org/project/requests/"
-#   version: "2.34.2"
-#   date: "2026-05-14"
-#
-#  - action: "actions/checkout"
-#    url: "https://github.com/actions/checkout/releases"
-#    version: "v7.0.1"
-#    date: "2026-07-17"
-#    commit: "3d3c42e5aac5ba805825da76410c181273ba90b1"
-
-# - action: "actions/setup-python"
-#   url: "https://github.com/actions/setup-python/releases"
-#   python-releases: "https://www.python.org/downloads/source/"
-#   version: "v7.0.0"
-#   date: "2026-07-19"
-#   commit: "5fda3b95a4ea91299a34e894583c3862153e4b97"
-#   with:
-#     python-version: "3.14"

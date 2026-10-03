@@ -1,108 +1,128 @@
-# 🚀 Control D x Hagezi-Sync
+# Control D × Hagezi Sync
 
-Automatically syncs DNS blocklist folders from [hagezi/dns-blocklists](https://github.com/hagezi/dns-blocklists) into your [Control D](https://controld.com) account via the Control D API.
+Keeps folders in your [Control D](https://controld.com) profiles in sync with the DNS blocklist/allowlist folders published by [hagezi/dns-blocklists](https://github.com/hagezi/dns-blocklists), using the Control D API and GitHub Actions. No server required.
 
-Runs on a GitHub Actions schedule — no server required.
+This repository is a **template**. It contains no credentials, no account-specific values, and **no scheduled runs**: nothing executes here on its own. You fork it, describe your own profiles and folders in `config.toml`, add your secrets, and then (optionally) switch on a schedule in *your* fork.
 
-This repository is a **public template**. It ships with placeholder profile/folder names and **does not include** any synced blocklist JSON. Fork it, replace the examples with your Control D names, then enable Actions in *your* fork.
-
----
-
-## 🔧 Features
-
-- ✅ Automated twice-daily sync via cron (5 AM & 5 PM UTC)
-- 🐍 Python-based sync script with retry logic
-- 🔒 Pinned dependencies and commit-hash-locked Actions
-- ✉️ Sends email with diff summary if files change
-- 📁 Keeps the `controld/` folder in sync with upstream
-- 🌐 Pushes domain changes to the Control D API automatically
-- 🔄 Idempotent reconciliation — self-healing across retried or partial runs
+> **Keep your fork private.** Workflow logs are public on public repositories and they name the profiles/folders you configure; `config.toml` and the synced `controld/` files also reveal which lists you use. Secrets are never printed, but a private fork avoids exposing the rest.
 
 ---
 
-## ⚙️ How It Works
+## What it does
 
-The workflow runs twice daily (05:00 and 17:00 UTC) in three stages:
+Each run has three stages (see `.github/workflows/sync-controld.yml`):
 
-1. 📥 **Stage 1 — File sync** (`scripts/controld_sync.py`)  
-   Downloads the target JSON files from the hagezi upstream repository and diffs them against the local copies, writing any changes into the working tree. Sets a `changed` flag for the next stage.
+1. **Stage 1 — download** (`scripts/controld_sync.py`): fetches the Hagezi `controld/*.json` files you selected, compares them with the copies stored in this repo's `controld/` directory, and writes any that changed into the working tree.
+2. **Stage 2 — push** (`scripts/controld_api_push.py`): runs only if Stage 1 found changes (or you set *force_push*). For every selected file it compares the file with the **live** contents of the matching Control D folder, **adds** missing domains and **removes** domains that are not in the file. Because it works from live state it is idempotent and recovers from interrupted runs. If email is configured, a report is sent.
+3. **Stage 3 — commit** (`scripts/controld_sync.py --commit`): commits the updated `controld/` files to your repo **only after Stage 2 succeeded**. If Stage 2 fails, nothing is committed, so the next run detects the same change and retries.
 
-2. 🌐 **Stage 2 — API push** (`scripts/controld_api_push.py`)  
-   Runs only when Stage 1 detected changes. Reads the updated JSON files and reconciles each mapped Control D folder against the desired state — adding new domains and removing stale ones. The reconciliation is always against the **live API state**, so the script is idempotent and self-healing if a previous run was interrupted.
+Safety behaviour: empty or unparsable files are refused (they would wipe a folder); a folder sync is aborted if it would delete more than `max_delete_percent` (default 50 %) of the folder's current rules; and within one profile a domain already placed in an earlier folder is skipped for later folders.
 
-3. 💾 **Stage 3 — Commit** (`scripts/controld_sync.py --commit`)  
-   Commits and pushes the synced files, but **only after Stage 2 succeeded**. This ordering is what makes the retry work: if the API push fails, the files stay uncommitted, so the next scheduled run re-detects the same diff and retries the push. Committing first would make the next run see no change and skip Stage 2 indefinitely.
+## Prerequisites
 
-✉️ An email report is sent after Stage 2 summarising every domain added, removed, or skipped per profile and folder.
+- A GitHub account (a free account is sufficient).
+- A Control D account with at least one profile and **pre-created folders** to receive each list. The scripts never create profiles or folders.
+- A Control D API token with **write** access (Control D dashboard, API section).
+- Python 3.11+ only if you want to validate your config locally (the workflow itself uses Python 3.14).
 
----
+## Setup
 
-## 🚀 Quick Start
+### 1. Fork or copy the repository
 
-> 💡 **Privacy & security note:** This repo runs entirely within your own GitHub Actions environment. Your API token is used only for outbound requests to the Control D API, and email credentials only for outbound SMTP — neither is logged or persisted beyond the runner. For maximum privacy and security it is recommended to keep your fork **private** — this prevents your profile names, folder names, and workflow configuration from being publicly visible.
+Fork it to your own account (or clone it and push it to a new repository), and make the copy **private**. In a fork, GitHub keeps Actions disabled until you open the *Actions* tab and confirm.
 
-### 1. Fork this repo
+### 2. Create `config.toml`
 
-Fork to your own GitHub account. Keep the fork **private** if you do not want your profile names, folder names, or synced JSON files to be public.
+Copy [`config.example.toml`](config.example.toml) to `config.toml` in the repository root and edit it:
 
-### 2. Configure your profile and folder mappings
+```toml
+[[lists]]
+file = "spam-tlds-folder.json"          # a file from hagezi/dns-blocklists → controld/
+targets = [
+  { profile = "My Profile", folder = "Spam TLDs" },   # exact, case-sensitive Control D names
+]
+```
 
-The scripts ship with **example** names (`Home`, `Travel`, and sample folder names). They will not match your Control D account until you change them.
+- `file` — pick from [hagezi/dns-blocklists/controld](https://github.com/hagezi/dns-blocklists/tree/main/controld).
+- `targets` — one or more `profile`/`folder` pairs that should mirror that file.
+- Put allow-list entries **before** block-list entries (earlier entries win on duplicate domains within a profile).
 
-1. Edit `scripts/controld_api_push.py` and replace `FILE_MAPPINGS` with your Control D profile and folder names.
-2. Edit `scripts/controld_sync.py` and set `TARGET_FILES` to the same upstream filenames (the keys of `FILE_MAPPINGS`).
+Check it without network access: `python scripts/controld_config.py config.toml`. Then commit `config.toml`. The full reference, with defaults, is in [CONFIGURATION.md](CONFIGURATION.md).
 
-See [CONFIGURATION.md](CONFIGURATION.md) for the full mapping format and a list of available upstream files.
+Without a `config.toml` the workflow stops at its first step, before doing anything.
 
-Do this **before** the first workflow run. Running with the example names will fail because those profiles/folders will not exist in your account.
+### 3. Add secrets
 
-### 3. Set the required secrets
+*Settings → Secrets and variables → Actions → New repository secret*:
 
-Go to **Settings → Secrets and variables → Actions → New repository secret** and add the following:
+| Secret | Required | Purpose |
+|---|---|---|
+| `CTRLD_API_TOKEN` | **yes** | Control D API token with write access |
+| `EMAIL_USERNAME`, `EMAIL_PASSWORD` | no | SMTP login for the optional email report (defaults to Gmail + an app password) |
+| `EMAIL_TO` | no | Report recipient (defaults to `EMAIL_USERNAME`) |
 
-#### 🔑 Required Secrets
+`GITHUB_TOKEN` is provided by GitHub automatically; you do not create it. Optional repository *variables* `EMAIL_SMTP_HOST` / `EMAIL_SMTP_PORT` select a non-Gmail mail server. Details in [CONFIGURATION.md](CONFIGURATION.md#secrets-and-variables).
 
-| Secret | Value | Description |
-|--------|-------|-------------|
-| `GITHUB_TOKEN` | *(auto-provided)* | Provided automatically by GitHub Actions |
-| `CTRLD_API_TOKEN` | Your Control D API token | Requires **write** permissions. Found in the Control D dashboard under **API**. |
+### 4. Run it manually
 
-#### ✉️ Email Notification Secrets (optional)
+*Actions → Sync Control D folders from upstream → Run workflow.*
 
-When changes are detected, the workflow can send an email report. Omit any to skip email:
+Before the first run read [First run](CONFIGURATION.md#first-run--important): the push makes each target folder match its file **exactly**, so any rules already in those folders that are not in the Hagezi file are removed. The `max_delete_percent` guard helps but is not a substitute for checking. Start with a spare/test folder.
 
-| Secret | Value | Description |
-|--------|-------|-------------|
-| `EMAIL_USERNAME` | Your Gmail address | e.g. `you@gmail.com` — used for SMTP auth, sender, and recipient |
-| `EMAIL_PASSWORD` | Your Gmail App Password | Generate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) — **not** your regular Gmail password |
+The *force_push* input re-applies the current files even if upstream has not changed. Use it after editing `config.toml` (for example after adding a second profile), because Stage 2 otherwise only runs when a downloaded file differs from the stored copy.
 
-Email is only sent when Stage 2 runs (i.e. files actually changed).
+### 5. Enable scheduled runs in your fork
 
-### 4. Run manually to verify
+The workflow ships with the schedule commented out. Once a manual run has succeeded, edit `.github/workflows/sync-controld.yml` in your fork and uncomment the block:
 
-Go to **Actions → Sync Control D folders from upstream → Run workflow** to trigger an immediate run and verify everything is working before waiting for the schedule.
+```yaml
+on:
+  workflow_dispatch:
+    ...
+  schedule:
+    - cron: '23 5,17 * * *'   # 05:23 and 17:23 UTC daily
+```
 
----
+Notes: cron times are UTC; scheduled workflows only run from the default branch; GitHub may delay runs at the top of the hour (hence `:23`); and on public repositories GitHub disables scheduled workflows after 60 days without repository activity.
 
-## 📂 Repository Structure
+The optional `clear-actions.yml` workflow (deletes old workflow runs) is manual-only too; uncomment its `schedule:` the same way if you want it.
+
+## Security considerations and limitations
+
+- **Destructive by design.** Folders are reconciled to the file, not merged. Don't point a folder holding hand-made rules at a Hagezi file.
+- **Folders must already exist**, with exactly the configured names.
+- **Rule action.** The script creates rules with `action.do = 0` and relies on the folder's own action. Check on a test folder that an allow-list folder really behaves as *allow* in your account before depending on it.
+- **Stage 2 only runs on change.** Manual edits you make in the Control D dashboard to a managed folder are not corrected until the next upstream change or a *force_push* run.
+- **Trust.** You are letting an upstream project and, if the mirror fallback is enabled (default), the official Hagezi build mirror decide what your DNS filter blocks and allows. Review Hagezi's lists and your folder actions accordingly. Set `mirror_fallback = false` to use GitHub only.
+- **Token handling.** `CTRLD_API_TOKEN` and the email secrets are given only to the step that needs them. The Actions token has `contents: write` only so Stage 3 can commit `controld/`, and is passed to `git` via environment variables so it is not stored in `.git/config`. Action versions are pinned to commit SHAs; Python dependencies are installed with `--require-hashes`.
+- **Logs and email.** Logs contain configured profile/folder names and counts, not secrets or domain lists. The optional email report **does** list every added/removed domain.
+- **No `pull_request`/`pull_request_target` triggers** on the operational workflow, so forks' pull requests cannot reach your secrets.
+
+## Maintenance automation
+
+- **Dependabot** (`.github/dependabot.yml`) opens weekly grouped PRs for GitHub Actions pins and for the hash-locked Python requirements. Review and merge them.
+- **CI** (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main` with a read-only token and no secrets: it compiles the scripts, validates `config.example.toml`, and runs the unit tests.
+
+## Repository layout
 
 ```
 .github/
-  dependabot.yml            # weekly auto-updates for Actions & pip deps
+  dependabot.yml             weekly updates: GitHub Actions + pip
   workflows/
-    sync-controld.yml       # workflow orchestrator
+    sync-controld.yml        the sync (manual; schedule commented out)
+    clear-actions.yml        optional old-run cleanup (manual; schedule commented out)
+    ci.yml                   compile + config validation + unit tests
 scripts/
-  controld_sync.py          # Stage 1: file sync
-  controld_api_push.py      # Stage 2: Control D API push
-requirements.in             # direct Python dependencies (source of truth)
-requirements.txt            # fully pinned deps with SHA-256 hashes (generated)
-CONFIGURATION.md            # detailed setup & configuration reference
-.gitignore
-controld/                   # synced JSON files (empty until your first successful run)
+  controld_config.py         config.toml loader/validator (shared)
+  controld_sync.py           Stage 1 (download) and Stage 3 (commit)
+  controld_api_push.py       Stage 2 (Control D API push)
+tests/test_config.py         unit tests for the config loader
+config.example.toml          example configuration -- copy to config.toml
+CONFIGURATION.md             configuration reference
+requirements.in / .txt       Python dependencies (source / hash-locked)
+controld/                    synced JSON files (empty until your first successful run)
 ```
 
----
+## Upstream
 
-## 🌐 Upstream Source
-
-All blocklist JSON files come from [hagezi/dns-blocklists](https://github.com/hagezi/dns-blocklists/tree/main/controld). Hat tip to hagezi for maintaining these lists.
+All list data comes from [hagezi/dns-blocklists](https://github.com/hagezi/dns-blocklists). Thanks to Hagezi for maintaining it. This project is not affiliated with Hagezi or Control D.
