@@ -4,6 +4,8 @@ Keeps folders in your [Control D](https://controld.com) profiles in sync with th
 
 This repository is a **template**. It contains no credentials, no account-specific values, and **no scheduled runs**: nothing executes here on its own. You fork it, describe your own profiles and folders in `config.toml`, add your secrets, and then (optionally) switch on a schedule in *your* fork.
 
+New here? Start with the [plain-English guide](CONFIGURATION.md#start-here-what-this-does-in-plain-english) in CONFIGURATION.md.
+
 > **Keep your fork private.** Workflow logs are public on public repositories and they name the profiles/folders you configure; `config.toml` and the synced `controld/` files also reveal which lists you use. Secrets are never printed, but a private fork avoids exposing the rest.
 
 ---
