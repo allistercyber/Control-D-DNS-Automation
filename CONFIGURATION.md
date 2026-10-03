@@ -1,4 +1,83 @@
-# Configuration reference
+# Control D × Hagezi Sync: guide and reference
+
+This page has two parts. **[Start here](#start-here-what-this-does-in-plain-english)** explains the project in plain English. The **[Configuration reference](#configuration-reference)** below it lists every setting and default.
+
+## Start here: what this does, in plain English
+
+### What it does
+
+[Hagezi](https://github.com/hagezi/dns-blocklists) publishes lists of domains to block or allow. [Control D](https://controld.com) is a DNS filtering service. This project copies Hagezi's lists into folders in your Control D profiles and keeps them up to date. It runs on GitHub (a free account is enough), so you do not need your own server.
+
+### The moving parts
+
+| Term | What it is |
+|---|---|
+| **Fork** | Your own copy of this repository. Everything runs from your copy. |
+| **`config.toml`** | Your shopping list: which Hagezi lists go into which Control D profile and folder. TOML is just a plain text format with lines like `file = "name.json"`. |
+| **Secrets** | Private values (such as your Control D API token) that GitHub stores for you and hands to the workflow. They are never shown in logs. |
+| **Workflow** | The robot that does the work. GitHub runs it for you when you press a button (or on a schedule, if you turn one on). |
+| **Folder** | A group of rules inside a Control D profile. Each folder mirrors exactly one Hagezi list. |
+
+### Before you start
+
+- [ ] A free GitHub account.
+- [ ] A Control D account.
+- [ ] A Control D profile, with **empty folders** already created in it. The scripts never create profiles or folders.
+- [ ] A Control D API token with **write** access (Control D dashboard, API section).
+
+### Quick start
+
+1. **Fork this repository and make your copy private.** If GitHub will not let you switch a fork to private, create a new private repository and push a copy of this one into it. Open the *Actions* tab of your copy and confirm that you want to enable workflows. Details: [README step 1](README.md#1-fork-or-copy-the-repository).
+2. **Copy `config.example.toml` to `config.toml` and replace the example names** with your real profile and folder names, then commit the file. The workflow reads the committed copy. Details: [`config.toml`](#configtoml).
+3. **Run the offline check** (needs Python 3.11 or newer; makes no network calls): `python scripts/controld_config.py config.toml`. On success it prints a line starting `Configuration OK:`. Otherwise it prints `ERROR:` and what to fix. Details: [`config.toml`](#configtoml).
+4. **Add the `CTRLD_API_TOKEN` secret** in *Settings → Secrets and variables → Actions*. Details: [Secrets and variables](#secrets-and-variables).
+5. **Run the workflow once by hand on an empty test folder**: *Actions → Sync Control D folders from upstream → Run workflow*. Check the folder in Control D afterwards. Read [First run](#first-run--important) first. Details: [README step 4](README.md#4-run-it-manually).
+6. **Only then turn on the schedule.** Details: [Enabling a schedule](#enabling-a-schedule).
+
+### How it keeps your DNS safe
+
+- It refuses to apply a file that is empty, has no `rules` list, or cannot be read. That file is skipped and the run is marked as failed.
+- It stops syncing a folder if the sync would remove more than `max_delete_percent` of the rules the folder currently has (default 50). The folder is left untouched and the run is marked as failed. This check only applies to folders that already contain rules. See [`[settings]`](#settings-optional-table).
+- Nothing runs on a schedule until you enable it. By default the workflow only runs when you press *Run workflow*.
+- Your repository is updated with the new files only after Control D was updated without errors. If a run fails, the next run tries again.
+
+### Things that surprise people
+
+- The folder is made to match the file **exactly**. Rules you added to that folder by hand are removed.
+- Names are case-sensitive and must match Control D exactly, including spaces.
+- After editing `config.toml`, run the workflow with **force_push** switched on. Otherwise nothing is pushed unless a Hagezi file has changed.
+- Keep your fork private. The workflow logs and `config.toml` show which profiles, folders and lists you use.
+- The optional email report lists every domain that was added or removed.
+- In `config.toml`, put allow-list entries **before** block-list entries. If the same domain is in two lists for one profile, the earlier entry keeps it.
+
+### If something goes wrong
+
+Open the failed run in the *Actions* tab and read the log of the step that has the red cross.
+
+| What you see | Likely cause | What to do |
+|---|---|---|
+| The workflow stops at **Validate configuration** | `config.toml` is missing from the repository (not committed, still named `config.example.toml`, or committed to a different branch), or it is invalid (bad TOML, a misspelled key, the same file or folder listed twice). The log line starts with `ERROR:` and says which. A missing file reads `configuration file 'config.toml' not found`. | Fix the file, commit it, and run `python scripts/controld_config.py config.toml` locally until it prints `Configuration OK`. |
+| The push step logs `Profile '…' not found among the account's … profile(s)` or `Folder '…' not found in profile '…'` | The name in `config.toml` differs from Control D (typo, capital letters, extra space), the folder was never created, or the API token belongs to a different account. | Copy the exact names from the Control D dashboard, create any missing folder there, then run again with **force_push**. |
+| Nothing happened after you edited `config.toml` | The push step only runs when a downloaded file differs from the copy in `controld/`. The *Sync files from upstream* log then says `No changes detected.` Also check that you committed `config.toml`: the workflow does not see local edits. | Commit and push `config.toml`, then run the workflow with **force_push** switched on. |
+| No email arrived | Email is skipped unless both `EMAIL_USERNAME` and `EMAIL_PASSWORD` are set. The report is also sent only when the push step runs, so a run with no changes sends nothing. If the API token is wrong, the profile list cannot be fetched and the log says `No email body found — skipping email send`. A mail server problem is logged as `Failed to send email:` and does not fail the run. | Set both secrets (for Gmail use an app password), check the log of the push step, and use **force_push** to test. See [Secrets and variables](#secrets-and-variables). |
+| The push step logs `Aborting sync for '…'` and `exceeds the … safety threshold` | The sync would remove more of the folder's rules than `max_delete_percent` allows, often because the folder holds hand-made rules or is not the folder you meant. | Check the folder. If the removal is intended, raise `max_delete_percent` in `config.toml`, then run again. |
+| The sync step logs `File not found in upstream: …` | The `file` name does not exist in Hagezi's `controld/` folder, or is misspelled. The step retries for several minutes before it gives up. | Pick a name from the [upstream list](https://github.com/hagezi/dns-blocklists/tree/main/controld). |
+| The push step logs `CTRLD_API_TOKEN environment variable is not set or empty` or `Cannot fetch profiles` | The secret is missing or misspelled, or the token is invalid. | Re-add the `CTRLD_API_TOKEN` secret with a token that has write access. |
+
+### Glossary
+
+- **Profile**: a set of DNS filtering settings in Control D, with its own folders and rules.
+- **Folder**: a group of rules inside a profile. This project fills a folder with one Hagezi list.
+- **Rule**: one domain to block or allow.
+- **Fork**: your own copy of a GitHub repository.
+- **Secret**: a private value stored in GitHub settings that workflows can use but nobody can read back.
+- **Workflow**: a job that GitHub runs for you from a file in `.github/workflows/`.
+- **Cron**: a schedule written as five fields, such as `23 5,17 * * *` (05:23 and 17:23 UTC every day).
+- **API token**: a long password that lets a program, here the workflow, change your Control D account.
+
+---
+
+## Configuration reference
 
 Everything you can configure, with defaults. For an overview and setup steps see [README.md](README.md).
 
