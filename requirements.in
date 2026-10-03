@@ -1,0 +1,7 @@
+requests==2.34.2
+
+# pip is pinned so the installer itself is hash-verified rather than fetched
+# unpinned from PyPI before the locked install runs.  It is an "unsafe" package
+# in pip-tools terms, so regenerating this lock file requires --allow-unsafe
+# (already recorded in the requirements.txt header).
+pip==26.2.1

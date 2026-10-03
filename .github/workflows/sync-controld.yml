@@ -1,0 +1,110 @@
+name: Sync Control D folders from upstream
+
+# ── Schedule ───────────────────────────────────────────────────────────────────
+# Runs twice daily.  Can also be triggered manually from the Actions tab if needed.
+on:
+  schedule:
+    - cron: '0 5  * * *'   # 05:00 UTC daily
+    - cron: '0 17 * * *'   # 17:00 UTC daily
+  workflow_dispatch:
+
+# ── Concurrency ────────────────────────────────────────────────────────────────
+# Prevent overlapping runs (e.g. scheduled + manual trigger at the same time).
+# A new run cancels any in-progress run so the latest upstream state always wins.
+concurrency:
+  group: controld-sync
+  cancel-in-progress: true
+
+# ── Permissions ────────────────────────────────────────────────────────────────
+# contents: write — needed to commit synced JSON files back to the repo.
+# Everything else is explicitly denied (principle of least privilege).
+permissions:
+  contents: write
+  actions: none
+  checks: none
+  deployments: none
+  id-token: none
+  issues: none
+  packages: none
+  pages: none
+  pull-requests: none
+  repository-projects: none
+  security-events: none
+  statuses: none
+
+# ── Jobs ───────────────────────────────────────────────────────────────────────
+jobs:
+  sync:
+    # Skip on the public template repo; forks run normally after you configure mappings.
+    if: github.repository != 'allistercyber/Control-D-DNS-Automation'
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout without persisting credentials; the sync script passes the
+      # token URL directly to git push (one-shot) so it is never written to
+      # .git/config and cannot appear in git error logs persistently.
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # pip itself is pinned and hash-locked in requirements.txt, so it is
+      # installed by this same --require-hashes pass rather than fetched
+      # unpinned beforehand.  The runner's pre-installed pip (from the pinned
+      # setup-python action) performs the verification; every wheel that lands
+      # in the environment, pip included, is hash-checked.
+      - name: Install dependencies
+        run: pip install --require-hashes -r requirements.txt
+
+      # ── Stage 1: Sync files from upstream ────────────────────────────────────
+      # Downloads the target JSON files from hagezi/dns-blocklists, diffs them
+      # against the local copies, writes changes into the working tree, and sets
+      # changed=true/false.  The commit is deferred to Stage 3 on purpose.
+      - name: Sync files from upstream
+        id: sync
+        env:
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/controld_sync.py
+
+      # ── Stage 2: Push domain changes to Control D API ────────────────────────
+      # Only runs when Stage 1 detected file changes.
+      # The email report is sent from within the script before sys.exit(), so it
+      # is delivered regardless of success or failure. The job fails on errors.
+      #
+      # NOTE: an explicit `if:` replaces the implicit `success()` guard, so
+      # success() is spelled out here — without it this step would still run
+      # after a failed Stage 1.
+      - name: Push changes to Control D API
+        id: push
+        if: success() && steps.sync.outputs.changed == 'true'
+        env:
+          CTRLD_API_TOKEN: ${{ secrets.CTRLD_API_TOKEN }}
+          EMAIL_USERNAME:  ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          python scripts/controld_api_push.py
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::error::Control D API push finished with errors (exit $EXIT_CODE). Check the step log."
+            exit $EXIT_CODE
+          fi
+
+      # ── Stage 3: Commit the synced files ─────────────────────────────────────
+      # Runs only after Stage 2 succeeded, so the repository never records an
+      # upstream state that was not actually applied to Control D.  If Stage 2
+      # fails the working tree stays uncommitted, so the next run re-detects the
+      # same diff and retries the API push instead of skipping it as unchanged.
+      - name: Commit synced files
+        if: success() && steps.sync.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/controld_sync.py --commit
