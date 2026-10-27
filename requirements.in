@@ -4,4 +4,4 @@ requests==2.34.2
 # unpinned from PyPI before the locked install runs.  It is an "unsafe" package
 # in pip-tools terms, so regenerating this lock file requires --allow-unsafe
 # (already recorded in the requirements.txt header).
-pip==26.2.1
+pip==26.2.2
